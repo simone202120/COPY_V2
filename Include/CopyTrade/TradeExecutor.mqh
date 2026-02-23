@@ -95,7 +95,6 @@ public:
          return false;
       }
 
-      datetime t_start = TimeCurrent();
       bool ok = false;
 
       if(signal.order_type == DIR_BUY)
@@ -198,9 +197,7 @@ public:
          if(signals[i].msg_type != SIGNAL_SYNC_RESPONSE) continue;
          if(!m_mapper.HasMapping(signals[i].master_ticket))
          {
-            // Use a non-const copy for ExecuteOpen (requires non-const ref in some compilers)
-            TradeSignal s = signals[i];
-            if(ExecuteOpen(s)) opened++;
+            if(ExecuteOpen(signals[i])) opened++;
          }
       }
 

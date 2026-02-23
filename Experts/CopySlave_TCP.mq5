@@ -80,6 +80,34 @@ void OnTimer()
    TradeSignal signals[50];
    int count = g_client.Receive(signals, 50);
 
+   // --- Pass 1: collect SYNC_RESPONSE signals and detect end-of-sync.
+   // Processing sync BEFORE real-time signals ensures CloseOrphans does not
+   // accidentally close a position that was just opened by a real-time SIGNAL_OPEN
+   // arriving in the same timer tick as the end of the sync batch.
+   bool has_realtime = false;
+   for(int i = 0; i < count; i++)
+   {
+      if(signals[i].msg_type == SIGNAL_SYNC_RESPONSE)
+      {
+         if(g_sync_count < 100)
+            g_sync_buf[g_sync_count++] = signals[i];
+      }
+      else
+      {
+         has_realtime = true;
+      }
+   }
+
+   // Sync batch is complete when a non-SYNC_RESPONSE arrives in the same tick,
+   // or when a full timer tick passes with no new data.
+   if(g_sync_count > 0 && (has_realtime || count == 0))
+   {
+      g_executor.ProcessSync(g_sync_buf, g_sync_count);
+      g_executor.CloseOrphans(g_sync_buf, g_sync_count);
+      g_sync_count = 0;
+   }
+
+   // --- Pass 2: real-time trade signals (OPEN, CLOSE, MODIFY)
    for(int i = 0; i < count; i++)
    {
       switch((int)signals[i].msg_type)
@@ -97,42 +125,11 @@ void OnTimer()
             break;
 
          case SIGNAL_SYNC_RESPONSE:
-            // Accumulate sync responses
-            if(g_sync_count < 100)
-               g_sync_buf[g_sync_count++] = signals[i];
-            break;
+            break; // already handled in pass 1
 
          default:
             g_logger.Warning("Unknown msg_type=" + IntegerToString(signals[i].msg_type));
             break;
-      }
-   }
-
-   // Process accumulated sync batch once per timer tick when batch is complete.
-   // A batch is considered complete when we received sync messages and then a
-   // non-sync message (or count was 0 but we have buffered data).
-   if(g_sync_count > 0)
-   {
-      // Check if this tick contained a non-SYNC_RESPONSE message,
-      // indicating the sync stream has ended.
-      bool sync_complete = false;
-      for(int i = 0; i < count; i++)
-      {
-         if(signals[i].msg_type != SIGNAL_SYNC_RESPONSE)
-         {
-            sync_complete = true;
-            break;
-         }
-      }
-      // Also treat as complete if we received nothing new (sync was already done)
-      if(count == 0)
-         sync_complete = true;
-
-      if(sync_complete)
-      {
-         g_executor.ProcessSync(g_sync_buf, g_sync_count);
-         g_executor.CloseOrphans(g_sync_buf, g_sync_count);
-         g_sync_count = 0;
       }
    }
 

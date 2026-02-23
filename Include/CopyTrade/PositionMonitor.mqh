@@ -33,6 +33,7 @@ private:
    PositionState m_prev[MAX_POSITIONS];
    int           m_prev_count;
    int           m_magic_filter;
+   bool          m_first_scan;   // First scan seeds cache only — no signals emitted
    CLogger      *m_logger;
 
    //--- Find a ticket in a PositionState array; returns index or -1
@@ -60,7 +61,7 @@ private:
    }
 
 public:
-   CPositionMonitor() : m_prev_count(0), m_magic_filter(0), m_logger(NULL) {}
+   CPositionMonitor() : m_prev_count(0), m_magic_filter(0), m_first_scan(true), m_logger(NULL) {}
 
    //--- Initialize with magic number filter and logger reference
    void Init(int magic_filter, CLogger &logger)
@@ -68,6 +69,7 @@ public:
       m_magic_filter = magic_filter;
       m_logger       = &logger;
       m_prev_count   = 0;
+      m_first_scan   = true;
       m_logger.Info("PositionMonitor initialized, magic_filter=" + IntegerToString(magic_filter));
    }
 
@@ -98,6 +100,19 @@ public:
          current[cur_count].sl      = PositionGetDouble(POSITION_SL);
          current[cur_count].tp      = PositionGetDouble(POSITION_TP);
          cur_count++;
+      }
+
+      // First call after EA start: seed the cache and emit no signals.
+      // Prevents false SIGNAL_OPEN bursts when the EA restarts while positions are already open.
+      if(m_first_scan)
+      {
+         m_first_scan = false;
+         m_prev_count = cur_count;
+         for(int i = 0; i < cur_count; i++)
+            m_prev[i] = current[i];
+         m_logger.Info("PositionMonitor: first scan, seeded cache with " +
+                       IntegerToString(cur_count) + " existing positions (no signals emitted)");
+         return 0;
       }
 
       int sig_count = 0;
