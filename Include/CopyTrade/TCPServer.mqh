@@ -113,8 +113,8 @@ public:
          }
       }
       // idx==-2 means no pending connection (WSAEWOULDBLOCK) — normal case
-      // idx < -2 means actual error
-      else if(idx < -2)
+      // any other negative code is an actual error (-1=not init, -3=max, -4=error, -5=no slot)
+      else if(idx != -2)
       {
          m_logger.Error("ServerAccept error code=" + IntegerToString(idx));
       }

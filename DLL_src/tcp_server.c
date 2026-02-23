@@ -41,7 +41,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
                 g_clients[i] = INVALID_SOCKET;
             break;
         case DLL_PROCESS_DETACH:
-            if(g_initialized) ServerClose();
+            /* lpvReserved==NULL means FreeLibrary path (safe to cleanup).
+             * lpvReserved!=NULL means process termination — avoid Winsock calls
+             * under loader lock to prevent deadlocks. */
+            if(g_initialized && lpvReserved == NULL) ServerClose();
             break;
     }
     return TRUE;

@@ -126,19 +126,33 @@ public:
          uint readable = SocketIsReadable(m_socket);
          if((int)readable < 64) break;
 
+         // Read exactly 64 bytes, accumulating across partial TCP segments
          uchar buf[];
          ArrayResize(buf, 64);
-         uint got = SocketRead(m_socket, buf, 64, 50);
-         if(got != 64)
+         uint total = 0;
+         bool read_failed = false;
+         while(total < 64)
          {
-            if(got == 0)
-               m_logger.Warning("SocketRead=0 — Master closed connection");
+            uchar chunk[];
+            uint got = SocketRead(m_socket, chunk, 64 - total, 50);
+            if(got > 0)
+            {
+               ArrayCopy(buf, chunk, (int)total, 0, (int)got);
+               total += got;
+            }
             else
-               m_logger.Error("SocketRead partial: got=" + IntegerToString(got) +
-                              " error=" + IntegerToString(GetLastError()));
-            MarkDisconnected();
-            break;
+            {
+               if(total > 0)
+                  m_logger.Warning("SocketRead stall at " + IntegerToString(total) +
+                                   "/64 bytes — disconnecting");
+               else
+                  m_logger.Warning("SocketRead=0 — Master closed connection");
+               MarkDisconnected();
+               read_failed = true;
+               break;
+            }
          }
+         if(read_failed) break;
 
          TradeSignal sig;
          ZeroMemory(sig);

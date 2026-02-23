@@ -31,7 +31,7 @@ enum ORDER_DIRECTION
 //|  0       1      uchar    msg_type      SIGNAL_TYPE value         |
 //|  1       4      uint     signal_id     Incremental ID             |
 //|  5       4      int      magic_number  EA magic number            |
-//|  9       12     char[12] symbol        Symbol null-terminated     |
+//|  9       12     uchar[12] symbol        Symbol null-terminated    |
 //|  21      1      uchar    order_type    0=BUY, 1=SELL             |
 //|  22      8      double   volume        Volume in lots             |
 //|  30      8      double   price         Open/close price           |
@@ -46,7 +46,7 @@ struct TradeSignal
    uchar    msg_type;        // SIGNAL_TYPE
    uint     signal_id;       // Incremental counter (anti-duplicate)
    int      magic_number;    // EA magic number
-   char     symbol[12];      // Symbol name, null-terminated
+   uchar    symbol[12];      // Symbol name, null-terminated
    uchar    order_type;      // ORDER_DIRECTION (0=BUY, 1=SELL)
    double   volume;          // Volume in lots
    double   price;           // Open/close price
@@ -124,7 +124,7 @@ void PrepareSignal(TradeSignal &signal)
 }
 
 //+------------------------------------------------------------------+
-//| Copy a symbol string into the char[12] field of TradeSignal     |
+//| Copy a symbol string into the uchar[12] field of TradeSignal    |
 //+------------------------------------------------------------------+
 void SetSignalSymbol(TradeSignal &signal, const string symbol)
 {
