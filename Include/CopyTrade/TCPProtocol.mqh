@@ -86,6 +86,7 @@ bool ValidateChecksum(const TradeSignal &signal)
 //+------------------------------------------------------------------+
 bool SerializeSignal(const TradeSignal &signal, uchar &buf[])
 {
+   ArrayResize(buf, 64);
    int bytes = StructToCharArray(signal, buf);
    return (bytes == 64);
 }

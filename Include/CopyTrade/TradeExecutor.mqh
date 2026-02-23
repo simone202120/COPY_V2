@@ -44,13 +44,6 @@ private:
       return NormalizeDouble(vol, 2);
    }
 
-   //--- Get current timestamp in ms for latency logging
-   string LatencyStr(datetime signal_time)
-   {
-      int ms = (int)((TimeCurrent() - signal_time) * 1000);
-      return IntegerToString(ms) + "ms";
-   }
-
 public:
    CTradeExecutor() : m_volume_multiplier(1.0), m_magic_slave(99999),
                       m_max_slippage(10), m_logger(NULL) {}
@@ -211,16 +204,8 @@ public:
          }
       }
 
-      // Step 2: close any Slave position whose master ticket is not in sync signals
-      int closed = 0;
-      for(int j = 0; j < m_mapper.Count(); j++)
-      {
-         // We cannot directly iterate mapper, so scan ticket list via position select
-         // Instead: iterate all slave positions with our magic, check if master ticket exists in sync
-         // (Simplified: iterate all current slave positions)
-      }
-      // Note: full orphan-close logic is handled by scanning slave positions in OnTimer
-      // Here we only open missing ones (the most critical action at sync time)
+      // Note: orphan closing (positions on Slave whose Master ticket is not in sync)
+      // is handled by CloseOrphans(), called by the EA right after ProcessSync().
 
       m_logger.Info("ProcessSync complete: opened=" + IntegerToString(opened));
    }

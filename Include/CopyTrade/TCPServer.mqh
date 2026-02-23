@@ -1,38 +1,21 @@
 //+------------------------------------------------------------------+
 //| TCPServer.mqh                                                      |
 //| Copy Trading TCP System                                            |
-//| TCP "server" using inverted model: Master connects to Slaves       |
+//| TCP server using tcp_server.dll for bind/listen/accept            |
 //+------------------------------------------------------------------+
 //|                                                                   |
-//| ARCHITECTURE NOTE:                                                |
-//| MQL5 does NOT have SocketBind/SocketListen/SocketAccept.          |
-//| Therefore we use an INVERTED MODEL:                               |
-//|   - Each Slave runs a minimal server via a DLL (see below) OR    |
-//|   - Master acts as a client connecting to each Slave.             |
+//| ARCHITECTURE:                                                     |
+//|   Master is a true TCP server — listens on ONE port (default 9500)|
+//|   All Slaves connect to Master using standard SocketConnect.      |
 //|                                                                   |
-//| CHOSEN APPROACH: Master as multi-client connector (push model)   |
-//|   - Master holds an array of {ip, port, socket} for each Slave   |
-//|   - ConnectToSlaves(): tries to connect to each configured Slave  |
-//|   - Broadcast(): sends signal to all connected Slaves             |
-//|   - CheckDisconnected(): detects and flags dropped connections    |
-//|   - HasSyncRequest(): Slave sends SYNC_REQUEST after connecting   |
+//| WHY DLL:                                                          |
+//|   MQL5 has no native SocketBind/SocketListen/SocketAccept.       |
+//|   tcp_server.dll wraps Winsock2 server operations.               |
 //|                                                                   |
-//| Each Slave must run a TCP listener. Since MQL5 Slave also cannot  |
-//| bind, Slaves use the same inverted model but wait for Master to   |
-//| connect. We achieve this by having Slave open a server socket     |
-//| via the MQL5 built-in WebRequest or by using a helper port.       |
-//|                                                                   |
-//| PRACTICAL FINAL DECISION:                                         |
-//| Both Master and Slave use standard SocketConnect. The difference  |
-//| is that Slave listens on a well-known port using a polling loop   |
-//| that attempts SocketCreate + SocketConnect in listening style.    |
-//| Since MQL5 v4 (build 2450+) introduced server socket support via  |
-//| SocketCreate(SOCKET_TYPE_SERVER) on some builds, we attempt it   |
-//| in TCPServer and fall back to the inverted model otherwise.       |
-//|                                                                   |
-//| IMPLEMENTATION: Master uses inverted model.                       |
-//|   Master knows Slave IPs/ports and connects outward.              |
-//|   Broadcast iterates all connected slave sockets.                 |
+//| SETUP:                                                            |
+//|   1. Compile DLL_src/tcp_server.c to tcp_server.dll (64-bit)     |
+//|   2. Place tcp_server.dll in MT5's MQL5/Libraries/ folder        |
+//|   3. Enable "Allow DLL imports" in MT5 Tools → Options           |
 //+------------------------------------------------------------------+
 #ifndef TCP_SERVER_MQH
 #define TCP_SERVER_MQH
@@ -40,175 +23,167 @@
 #include "TCPProtocol.mqh"
 #include "Logger.mqh"
 
-#define MAX_SLAVES 4
+//--- Import DLL functions
+#import "tcp_server.dll"
+   int  ServerCreate(int port);
+   int  ServerAccept();
+   int  ServerSend(int client_idx, const uchar &buf[], int len);
+   int  ServerRead(int client_idx, uchar &buf[], int len);
+   int  ServerIsReadable(int client_idx);
+   int  ServerIsConnected(int client_idx);
+   int  ServerCloseClient(int client_idx);
+   void ServerClose();
+#import
 
-//--- Slave connection record
-struct SlaveRecord
+#define MAX_SLAVES 8
+
+//--- Per-client state tracked by MQL5 side
+struct ClientRecord
 {
-   string   ip;
-   int      port;
-   int      socket;        // INVALID_HANDLE if not connected
-   bool     connected;
-   bool     sync_requested; // Slave sent SYNC_REQUEST
-   datetime last_connect_attempt;
+   int      idx;            // DLL client index (0..MAX_SLAVES-1)
+   bool     active;
+   bool     sync_requested;
 };
 
 //+------------------------------------------------------------------+
-//| CTCPServer — manages outbound connections to configured Slaves   |
+//| CTCPServer — wraps DLL server socket for use in MQL5            |
 //+------------------------------------------------------------------+
 class CTCPServer
 {
 private:
-   SlaveRecord  m_slaves[MAX_SLAVES];
-   int          m_slave_count;
+   ClientRecord m_clients[MAX_SLAVES];
+   int          m_client_count;
+   int          m_port;
    CLogger     *m_logger;
-   int          m_connect_timeout_ms;
-   int          m_reconnect_sec;
-
-   //--- Try to connect to one slave
-   bool ConnectSlave(int idx)
-   {
-      SlaveRecord &s = m_slaves[idx];
-      if(s.connected) return true;
-
-      datetime now = TimeCurrent();
-      if((int)(now - s.last_connect_attempt) < m_reconnect_sec) return false;
-      s.last_connect_attempt = now;
-
-      m_logger.Info("Connecting to Slave[" + IntegerToString(idx) + "] " + s.ip + ":" + IntegerToString(s.port));
-
-      int sock = SocketCreate();
-      if(sock == INVALID_HANDLE)
-      {
-         m_logger.Error("SocketCreate failed, error=" + IntegerToString(GetLastError()));
-         return false;
-      }
-
-      if(!SocketConnect(sock, s.ip, s.port, m_connect_timeout_ms))
-      {
-         m_logger.Warning("Cannot connect to Slave[" + IntegerToString(idx) + "] " + s.ip + ":" + IntegerToString(s.port) +
-                          " error=" + IntegerToString(GetLastError()));
-         SocketClose(sock);
-         return false;
-      }
-
-      s.socket    = sock;
-      s.connected = true;
-      s.sync_requested = false;
-      m_logger.Info("Slave[" + IntegerToString(idx) + "] connected: " + s.ip + ":" + IntegerToString(s.port));
-      return true;
-   }
+   bool         m_running;
 
 public:
-   CTCPServer() : m_slave_count(0), m_logger(NULL),
-                  m_connect_timeout_ms(3000), m_reconnect_sec(5) {}
+   CTCPServer() : m_client_count(0), m_port(9500),
+                  m_logger(NULL), m_running(false) {}
 
-   //--- Initialize with logger reference
-   //--- Call AddSlave() after Init() to register Slave endpoints
-   bool Init(CLogger &logger, int connect_timeout_ms = 3000, int reconnect_sec = 5)
+   //--- Initialize and start listening
+   bool Init(int port, CLogger &logger)
    {
-      m_logger              = &logger;
-      m_connect_timeout_ms  = connect_timeout_ms;
-      m_reconnect_sec       = reconnect_sec;
-      m_slave_count         = 0;
+      m_port   = port;
+      m_logger = &logger;
 
       for(int i = 0; i < MAX_SLAVES; i++)
       {
-         m_slaves[i].socket           = INVALID_HANDLE;
-         m_slaves[i].connected        = false;
-         m_slaves[i].sync_requested   = false;
-         m_slaves[i].last_connect_attempt = 0;
+         m_clients[i].idx           = -1;
+         m_clients[i].active        = false;
+         m_clients[i].sync_requested = false;
       }
 
-      m_logger.Info("TCPServer initialized (inverted model — Master connects to Slaves)");
-      return true;
-   }
-
-   //--- Register a Slave endpoint (call once per slave during OnInit)
-   bool AddSlave(const string ip, const int port)
-   {
-      if(m_slave_count >= MAX_SLAVES)
+      int result = ServerCreate(port);
+      if(result != 0)
       {
-         m_logger.Error("AddSlave: max slaves reached (" + IntegerToString(MAX_SLAVES) + ")");
+         m_logger.Error("ServerCreate(" + IntegerToString(port) + ") failed, code=" +
+                        IntegerToString(result) +
+                        ". Ensure tcp_server.dll is in MQL5/Libraries/ and DLL imports are allowed.");
          return false;
       }
-      m_slaves[m_slave_count].ip               = ip;
-      m_slaves[m_slave_count].port             = port;
-      m_slaves[m_slave_count].socket           = INVALID_HANDLE;
-      m_slaves[m_slave_count].connected        = false;
-      m_slaves[m_slave_count].sync_requested   = false;
-      m_slaves[m_slave_count].last_connect_attempt = 0;
-      m_slave_count++;
-      m_logger.Info("Slave registered: " + ip + ":" + IntegerToString(port));
+
+      m_running = true;
+      m_logger.Info("TCPServer listening on port " + IntegerToString(port));
       return true;
    }
 
-   //--- Called from OnTimer: attempt connection to any disconnected Slave
+   //--- Called from OnTimer: accept any pending new connections (non-blocking)
    void AcceptNewClients()
    {
-      for(int i = 0; i < m_slave_count; i++)
-         if(!m_slaves[i].connected)
-            ConnectSlave(i);
+      if(!m_running) return;
+      if(m_client_count >= MAX_SLAVES) return;
+
+      int idx = ServerAccept();
+      if(idx >= 0) // New client connected
+      {
+         // Find free MQL5 slot
+         for(int i = 0; i < MAX_SLAVES; i++)
+         {
+            if(!m_clients[i].active)
+            {
+               m_clients[i].idx           = idx;
+               m_clients[i].active        = true;
+               m_clients[i].sync_requested = false;
+               m_client_count++;
+               m_logger.Info("New Slave connected (slot=" + IntegerToString(i) +
+                             " dll_idx=" + IntegerToString(idx) + ")");
+               break;
+            }
+         }
+      }
+      // idx==-2 means no pending connection (WSAEWOULDBLOCK) — normal case
+      // idx < -2 means actual error
+      else if(idx < -2)
+      {
+         m_logger.Error("ServerAccept error code=" + IntegerToString(idx));
+      }
    }
 
-   //--- Called from OnTimer: check for dropped connections and SYNC_REQUEST
+   //--- Called from OnTimer: remove dead connections, read SYNC_REQUEST
    void CheckDisconnected()
    {
-      for(int i = 0; i < m_slave_count; i++)
-      {
-         SlaveRecord &s = m_slaves[i];
-         if(!s.connected) continue;
+      if(!m_running) return;
 
-         // Try to detect broken socket by checking readable bytes
-         // A closed socket returns -1 on SocketIsReadable
-         int readable = (int)SocketIsReadable(s.socket);
-         if(readable < 0)
+      for(int i = 0; i < MAX_SLAVES; i++)
+      {
+         if(!m_clients[i].active) continue;
+
+         // Check DLL side still considers it connected
+         if(!ServerIsConnected(m_clients[i].idx))
          {
-            m_logger.Warning("Slave[" + IntegerToString(i) + "] disconnected (socket error)");
-            SocketClose(s.socket);
-            s.socket    = INVALID_HANDLE;
-            s.connected = false;
+            m_logger.Warning("Slave slot=" + IntegerToString(i) + " disconnected");
+            m_clients[i].active = false;
+            m_clients[i].idx    = -1;
+            m_client_count--;
             continue;
          }
 
-         // Read any pending data — check for SYNC_REQUEST
+         // Read any pending bytes and check for SYNC_REQUEST
+         int readable = ServerIsReadable(m_clients[i].idx);
          if(readable >= 64)
          {
             uchar buf[];
             ArrayResize(buf, 64);
-            uint received = SocketRead(s.socket, buf, 64, 100);
-            if(received == 64)
+            int got = ServerRead(m_clients[i].idx, buf, 64);
+            if(got == 64)
             {
                TradeSignal sig;
                if(DeserializeSignal(buf, sig) && ValidateChecksum(sig))
                {
                   if(sig.msg_type == SIGNAL_SYNC_REQUEST)
                   {
-                     s.sync_requested = true;
-                     m_logger.Info("SYNC_REQUEST received from Slave[" + IntegerToString(i) + "]");
+                     m_clients[i].sync_requested = true;
+                     m_logger.Info("SYNC_REQUEST from Slave slot=" + IntegerToString(i));
                   }
                }
+               else
+               {
+                  m_logger.Warning("Invalid message from Slave slot=" + IntegerToString(i));
+               }
             }
-            else if(received == 0)
+            else if(got < 0) // -3 = disconnected
             {
-               m_logger.Warning("Slave[" + IntegerToString(i) + "] read 0 bytes, marking disconnected");
-               SocketClose(s.socket);
-               s.socket    = INVALID_HANDLE;
-               s.connected = false;
+               m_logger.Warning("Slave slot=" + IntegerToString(i) + " read error=" +
+                                IntegerToString(got));
+               m_clients[i].active = false;
+               m_clients[i].idx    = -1;
+               m_client_count--;
             }
          }
       }
    }
 
-   //--- Check if any slave has a pending SYNC_REQUEST; returns slave index or -1
+   //--- Check if any client has a pending SYNC_REQUEST
+   //--- Returns true and sets slave_index to the slot number; clears the flag
    bool HasSyncRequest(int &slave_index)
    {
-      for(int i = 0; i < m_slave_count; i++)
+      for(int i = 0; i < MAX_SLAVES; i++)
       {
-         if(m_slaves[i].connected && m_slaves[i].sync_requested)
+         if(m_clients[i].active && m_clients[i].sync_requested)
          {
             slave_index = i;
-            m_slaves[i].sync_requested = false;
+            m_clients[i].sync_requested = false;
             return true;
          }
       }
@@ -216,24 +191,23 @@ public:
       return false;
    }
 
-   //--- Send a signal to a specific slave by index
-   bool SendTo(int slave_index, TradeSignal &signal)
+   //--- Send a signal to one slave slot
+   bool SendTo(int slot, TradeSignal &signal)
    {
-      if(slave_index < 0 || slave_index >= m_slave_count) return false;
-      SlaveRecord &s = m_slaves[slave_index];
-      if(!s.connected) return false;
+      if(slot < 0 || slot >= MAX_SLAVES) return false;
+      if(!m_clients[slot].active)        return false;
 
       uchar buf[];
       if(!SerializeSignal(signal, buf)) return false;
 
-      uint sent = SocketSend(s.socket, buf, ArraySize(buf));
-      if(sent != (uint)ArraySize(buf))
+      int sent = ServerSend(m_clients[slot].idx, buf, ArraySize(buf));
+      if(sent != ArraySize(buf))
       {
-         m_logger.Error("SendTo Slave[" + IntegerToString(slave_index) + "] failed: sent=" +
-                        IntegerToString(sent) + " error=" + IntegerToString(GetLastError()));
-         SocketClose(s.socket);
-         s.socket    = INVALID_HANDLE;
-         s.connected = false;
+         m_logger.Error("SendTo slot=" + IntegerToString(slot) +
+                        " sent=" + IntegerToString(sent) + " (disconnected?)");
+         m_clients[slot].active = false;
+         m_clients[slot].idx    = -1;
+         m_client_count--;
          return false;
       }
       return true;
@@ -243,36 +217,25 @@ public:
    int Broadcast(TradeSignal &signal)
    {
       int ok_count = 0;
-      for(int i = 0; i < m_slave_count; i++)
-         if(m_slaves[i].connected)
+      for(int i = 0; i < MAX_SLAVES; i++)
+         if(m_clients[i].active)
             if(SendTo(i, signal)) ok_count++;
       return ok_count;
    }
 
-   //--- Return number of currently connected slaves
-   int ConnectedCount()
-   {
-      int n = 0;
-      for(int i = 0; i < m_slave_count; i++)
-         if(m_slaves[i].connected) n++;
-      return n;
-   }
+   int ConnectedCount() { return m_client_count; }
 
-   //--- Close all connections
+   //--- Close server and all connections
    void Deinit()
    {
+      if(!m_running) return;
       if(m_logger != NULL)
-         m_logger.Info("TCPServer closing " + IntegerToString(m_slave_count) + " slave connection(s)");
-
-      for(int i = 0; i < m_slave_count; i++)
-      {
-         if(m_slaves[i].connected)
-         {
-            SocketClose(m_slaves[i].socket);
-            m_slaves[i].socket    = INVALID_HANDLE;
-            m_slaves[i].connected = false;
-         }
-      }
+         m_logger.Info("TCPServer closing (" + IntegerToString(m_client_count) + " clients)");
+      ServerClose();
+      m_running      = false;
+      m_client_count = 0;
+      for(int i = 0; i < MAX_SLAVES; i++)
+         m_clients[i].active = false;
    }
 };
 

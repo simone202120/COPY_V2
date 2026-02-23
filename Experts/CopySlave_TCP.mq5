@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //| CopySlave_TCP.mq5                                                  |
 //| Copy Trading TCP System — Slave EA                                 |
-//| Receives signals from Master and replicates trades               |
+//| Connects to Master TCP server and replicates trades               |
 //+------------------------------------------------------------------+
 #property copyright "Copy Trading TCP System"
 #property link      ""
@@ -14,24 +14,23 @@
 #include "../Include/CopyTrade/Logger.mqh"
 
 //--- Input parameters
-input string  MasterIP         = "127.0.0.1";  // Master IP (used in CONNECT mode)
-input int     ListenPort       = 9501;          // Port to listen on (LISTEN mode)
-input double  VolumeMultiplier = 1.0;           // Volume multiplier (0.5 = half, 2.0 = double)
+input string  MasterIP         = "127.0.0.1";  // Master VPS IP address
+input int     MasterPort       = 9500;          // Master TCP port
+input double  VolumeMultiplier = 1.0;           // Volume multiplier (0.5=half, 2.0=double)
 input int     MagicSlave       = 99999;         // Magic number for copied trades
 input string  SymbolSuffix     = "";            // Symbol suffix (e.g. "m" for EURUSDm)
 input string  SymbolPrefix     = "";            // Symbol prefix
-input int     ReconnectSec     = 2;             // Seconds between reconnect attempts
-input int     MaxSlippage      = 10;            // Max slippage in points
+input int     ReconnectSec     = 2;             // Reconnect retry interval (seconds)
+input int     MaxSlippage      = 10;            // Maximum slippage in points
 
 //--- Global objects
 CLogger        g_logger;
 CTCPClient     g_client;
 CTradeExecutor g_executor;
 
-//--- Sync accumulation buffer
-TradeSignal    g_sync_buffer[100];
-int            g_sync_count  = 0;
-bool           g_sync_active = false;
+//--- Sync state
+TradeSignal    g_sync_buf[100];
+int            g_sync_count = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -40,24 +39,22 @@ int OnInit()
 {
    g_logger.Init("SLAVE");
    g_logger.Info("=== CopySlave_TCP v1.00 Starting ===");
-   g_logger.Info("ListenPort=" + IntegerToString(ListenPort) +
-                 " MasterIP=" + MasterIP +
-                 " VolumeMultiplier=" + DoubleToString(VolumeMultiplier, 2) +
-                 " MagicSlave=" + IntegerToString(MagicSlave));
+   g_logger.Info("Master=" + MasterIP + ":" + IntegerToString(MasterPort));
+   g_logger.Info("VolMult=" + DoubleToString(VolumeMultiplier, 2) +
+                 " Magic=" + IntegerToString(MagicSlave) +
+                 " Slippage=" + IntegerToString(MaxSlippage));
    g_logger.Info("SymbolMapping: prefix='" + SymbolPrefix + "' suffix='" + SymbolSuffix + "'");
 
-   // Initialize trade executor
    g_executor.Init(VolumeMultiplier, MagicSlave, MaxSlippage,
                    SymbolPrefix, SymbolSuffix, g_logger);
 
-   // Initialize TCP client
-   if(!g_client.Init(MasterIP, ListenPort, ReconnectSec, g_logger))
+   if(!g_client.Init(MasterIP, MasterPort, ReconnectSec, g_logger))
    {
       g_logger.Error("TCPClient Init failed");
       return INIT_FAILED;
    }
 
-   // Start listening (or connect, depending on SLAVE_LISTEN_MODE)
+   // Try initial connection (non-fatal if Master not yet up)
    g_client.Connect();
 
    // 10ms timer for maximum signal processing reactivity
@@ -68,21 +65,18 @@ int OnInit()
 }
 
 //+------------------------------------------------------------------+
-//| Called every 10ms — receive and execute signals                  |
+//| OnTimer (every 10ms) — receive and execute signals               |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   // Poll for accepted connection (listen mode only)
-   g_client.PollAccept();
-
-   // Reconnect if disconnected
+   // Reconnect if not connected
    if(!g_client.IsConnected())
    {
       g_client.TryReconnect();
       return;
    }
 
-   // Receive available signals (non-blocking)
+   // Receive all pending signals (non-blocking)
    TradeSignal signals[50];
    int count = g_client.Receive(signals, 50);
 
@@ -103,15 +97,9 @@ void OnTimer()
             break;
 
          case SIGNAL_SYNC_RESPONSE:
-            // Accumulate sync responses until batch is complete.
-            // Since multiple SYNC_RESPONSE messages can arrive in sequence,
-            // we buffer them and process after receiving all in this timer tick.
+            // Accumulate sync responses
             if(g_sync_count < 100)
-            {
-               g_sync_buffer[g_sync_count] = signals[i];
-               g_sync_count++;
-               g_sync_active = true;
-            }
+               g_sync_buf[g_sync_count++] = signals[i];
             break;
 
          default:
@@ -120,25 +108,35 @@ void OnTimer()
       }
    }
 
-   // Process accumulated sync batch at end of this timer tick
-   if(g_sync_active && count > 0)
+   // Process accumulated sync batch once per timer tick when batch is complete.
+   // A batch is considered complete when we received sync messages and then a
+   // non-sync message (or count was 0 but we have buffered data).
+   if(g_sync_count > 0)
    {
-      // Check if we received any non-sync signals after sync batch (indicates sync is complete)
-      bool has_non_sync = false;
+      // Check if this tick contained a non-SYNC_RESPONSE message,
+      // indicating the sync stream has ended.
+      bool sync_complete = false;
       for(int i = 0; i < count; i++)
-         if(signals[i].msg_type != SIGNAL_SYNC_RESPONSE)
-            { has_non_sync = true; break; }
-
-      if(has_non_sync || g_sync_count > 0)
       {
-         g_executor.ProcessSync(g_sync_buffer, g_sync_count);
-         g_executor.CloseOrphans(g_sync_buffer, g_sync_count);
-         g_sync_count  = 0;
-         g_sync_active = false;
+         if(signals[i].msg_type != SIGNAL_SYNC_RESPONSE)
+         {
+            sync_complete = true;
+            break;
+         }
+      }
+      // Also treat as complete if we received nothing new (sync was already done)
+      if(count == 0)
+         sync_complete = true;
+
+      if(sync_complete)
+      {
+         g_executor.ProcessSync(g_sync_buf, g_sync_count);
+         g_executor.CloseOrphans(g_sync_buf, g_sync_count);
+         g_sync_count = 0;
       }
    }
 
-   // Check heartbeat (logs warning if >15s without heartbeat)
+   // Warn if no heartbeat from Master in 15 seconds
    g_client.CheckHeartbeat();
 }
 
